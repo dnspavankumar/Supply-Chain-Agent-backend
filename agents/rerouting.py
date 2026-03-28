@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import inspect
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from agno.agent import Agent
@@ -25,6 +26,7 @@ except Exception:  # pragma: no cover
 
 CURFEW_START_HOUR = 22
 CURFEW_END_HOUR = 6
+MAX_ROUTE_OPTIONS = 4
 
 
 class ReroutingNarrative(BaseModel):
@@ -63,13 +65,19 @@ class ReroutingAgent:
         self._audit_store = audit_store or AuditStore(file_path="audit.jsonl")
         self._compliance_engine = compliance_engine or ComplianceEngine()
         self._map_routing_service = map_routing_service or MapRoutingService()
+        api_key = (settings.google_api_key or "").strip()
+        if settings.require_google_api_key and not api_key:
+            raise RuntimeError(
+                "GOOGLE_API_KEY is required in strict mode. "
+                "Set GOOGLE_API_KEY (or GEMINI_API_KEY) in .env before starting backend."
+            )
 
         self._schema_param_name: str | None = None
         self._run_schema_param_name: str | None = None
 
         model = Gemini(
             id=settings.gemini_model_id,
-            api_key=settings.google_api_key or None,
+            api_key=api_key or None,
         )
         self._agent = self._build_agent(model)
 
@@ -105,19 +113,36 @@ class ReroutingAgent:
         return Agent(**kwargs)
 
     async def reroute(self, request: ReroutingRequest) -> ReroutingResult:
-        map_metrics = await self._fetch_metrics(request.available_alternatives)
-        scored_routes, selected = self._score_and_filter_routes(request, map_metrics)
+        candidate_routes, map_metrics = await self._resolve_route_options(request)
+        scored_routes, selected = self._score_and_filter_routes(
+            request=request,
+            candidate_routes=candidate_routes,
+            map_metrics=map_metrics,
+        )
 
         status = "REROUTED" if selected is not None else "ESCALATE"
+        try:
+            narrative = await self._generate_rationale(
+                request=request,
+                status=status,
+                selected=selected,
+                scored_routes=scored_routes,
+            )
+        except Exception as exc:
+            selected = self._fallback_to_next_shortest_route(scored_routes, selected)
+            status = "REROUTED" if selected is not None else "ESCALATE"
+            narrative = ReroutingNarrative(
+                rationale=self._build_failover_rationale(
+                    request=request,
+                    selected=selected,
+                    scored_routes=scored_routes,
+                    llm_error=str(exc),
+                ),
+                confidence=0.35,
+            )
+
         selected_route = selected.route if selected is not None else None
         selected_score = selected.score if selected is not None else None
-
-        narrative = await self._generate_rationale(
-            request=request,
-            status=status,
-            selected=selected,
-            scored_routes=scored_routes,
-        )
 
         result = ReroutingResult(
             ticket_id=request.ticket_id,
@@ -130,6 +155,56 @@ class ReroutingAgent:
         await self._write_audit_log(request, result, narrative.confidence)
         return result
 
+    async def _resolve_route_options(
+        self,
+        request: ReroutingRequest,
+    ) -> tuple[list[RouteInput], list[RouteMetrics | None]]:
+        explicit_routes = list(request.available_alternatives)[:MAX_ROUTE_OPTIONS]
+        if explicit_routes:
+            return explicit_routes, await self._fetch_metrics(explicit_routes)
+
+        generated_metrics = await self._map_routing_service.get_route_alternatives(
+            request.original_route,
+            max_alternatives=MAX_ROUTE_OPTIONS,
+        )
+        if generated_metrics:
+            generated_routes = self._build_generated_routes(
+                request=request,
+                route_count=len(generated_metrics),
+            )
+            return generated_routes, list(generated_metrics)
+
+        fallback_route = RouteInput(
+            origin=request.original_route.origin,
+            destination=request.original_route.destination,
+            waypoints=list(request.original_route.waypoints),
+            estimated_arrival_time=(
+                request.estimated_arrival_time or request.original_route.estimated_arrival_time
+            ),
+        )
+        fallback_metrics = await self._fetch_metrics([fallback_route])
+        return [fallback_route], fallback_metrics
+
+    def _build_generated_routes(
+        self,
+        request: ReroutingRequest,
+        route_count: int,
+    ) -> list[RouteInput]:
+        base_eta = request.estimated_arrival_time or request.original_route.estimated_arrival_time
+        generated: list[RouteInput] = []
+
+        for idx in range(route_count):
+            eta = base_eta + timedelta(minutes=idx * 10) if base_eta is not None else None
+            generated.append(
+                RouteInput(
+                    origin=request.original_route.origin,
+                    destination=request.original_route.destination,
+                    waypoints=list(request.original_route.waypoints),
+                    estimated_arrival_time=eta,
+                )
+            )
+        return generated
+
     async def _fetch_metrics(self, routes: list[RouteInput]) -> list[RouteMetrics | None]:
         tasks = [self._map_routing_service.get_route_metrics(route) for route in routes]
         return await asyncio.gather(*tasks)
@@ -137,16 +212,24 @@ class ReroutingAgent:
     def _score_and_filter_routes(
         self,
         request: ReroutingRequest,
+        candidate_routes: list[RouteInput],
         map_metrics: list[RouteMetrics | None],
     ) -> tuple[list[ScoredRoute], ScoredRoute | None]:
         durations = [metric.duration_min for metric in map_metrics if metric is not None]
         duration_min = min(durations) if durations else None
         duration_max = max(durations) if durations else None
+        eta_values = [
+            (route.estimated_arrival_time or request.estimated_arrival_time).timestamp()
+            for route in candidate_routes
+            if (route.estimated_arrival_time or request.estimated_arrival_time) is not None
+        ]
+        eta_min = min(eta_values) if eta_values else None
+        eta_max = max(eta_values) if eta_values else None
 
         scored_routes: list[ScoredRoute] = []
         compliant_candidates: list[ScoredRoute] = []
 
-        for route, metrics in zip(request.available_alternatives, map_metrics):
+        for route, metrics in zip(candidate_routes, map_metrics):
             weather_adjusted, safety_adjusted = self._adjust_scores_for_map_metrics(
                 request.weather_score,
                 request.road_safety_score,
@@ -155,6 +238,14 @@ class ReroutingAgent:
                 duration_max,
             )
             score = compute_route_score(weather_adjusted, safety_adjusted)
+            score = self._apply_fallback_eta_adjustment(
+                score=score,
+                route_eta=(route.estimated_arrival_time or request.estimated_arrival_time),
+                eta_min=eta_min,
+                eta_max=eta_max,
+                metrics_present=metrics is not None,
+            )
+            score = self._apply_waypoint_penalty(score, route.waypoints)
 
             disqualifications: list[str] = []
             restricted_check = self._compliance_engine.check_restricted_zones(route)
@@ -172,6 +263,7 @@ class ReroutingAgent:
                 map_distance_km=metrics.distance_km if metrics is not None else None,
                 map_duration_min=metrics.duration_min if metrics is not None else None,
                 map_source=metrics.source if metrics is not None else None,
+                map_geometry=metrics.geometry_coords if metrics is not None else [],
             )
             scored_routes.append(candidate)
             if not disqualifications:
@@ -179,6 +271,94 @@ class ReroutingAgent:
 
         selected = max(compliant_candidates, key=lambda route: route.score) if compliant_candidates else None
         return scored_routes, selected
+
+    def _rank_compliant_by_shortest(self, scored_routes: list[ScoredRoute]) -> list[ScoredRoute]:
+        compliant = [route for route in scored_routes if not route.disqualification_reason]
+        return sorted(
+            compliant,
+            key=lambda route: (
+                route.map_duration_min if route.map_duration_min is not None else math.inf,
+                route.map_distance_km if route.map_distance_km is not None else math.inf,
+                -route.score,
+            ),
+        )
+
+    def _fallback_to_next_shortest_route(
+        self,
+        scored_routes: list[ScoredRoute],
+        current_selected: ScoredRoute | None,
+    ) -> ScoredRoute | None:
+        ranked = self._rank_compliant_by_shortest(scored_routes)
+        if not ranked:
+            return None
+        if current_selected is None:
+            return ranked[0]
+
+        current_signature = self._route_signature(current_selected.route)
+        for candidate in ranked:
+            if self._route_signature(candidate.route) != current_signature:
+                return candidate
+        return ranked[0]
+
+    def _route_signature(self, route: RouteInput) -> str:
+        waypoints = ",".join(route.waypoints or [])
+        return f"{route.origin}|{waypoints}|{route.destination}"
+
+    def _build_failover_rationale(
+        self,
+        request: ReroutingRequest,
+        selected: ScoredRoute | None,
+        scored_routes: list[ScoredRoute],
+        llm_error: str,
+    ) -> str:
+        compact_error = " ".join(llm_error.split())
+        if len(compact_error) > 180:
+            compact_error = f"{compact_error[:177]}..."
+
+        ranked = self._rank_compliant_by_shortest(scored_routes)
+        if selected is not None:
+            rank = 1
+            selected_signature = self._route_signature(selected.route)
+            for index, candidate in enumerate(ranked, start=1):
+                if self._route_signature(candidate.route) == selected_signature:
+                    rank = index
+                    break
+            return (
+                f"LLM rationale unavailable ({compact_error}). "
+                f"Applied deterministic failover and selected shortest compliant candidate rank {rank} "
+                f"with score {selected.score:.3f}."
+            )
+
+        return (
+            f"LLM rationale unavailable ({compact_error}). "
+            f"No compliant alternatives remained after guardrail checks; escalation required."
+        )
+
+    def _apply_fallback_eta_adjustment(
+        self,
+        score: float,
+        route_eta: datetime | None,
+        eta_min: float | None,
+        eta_max: float | None,
+        metrics_present: bool,
+    ) -> float:
+        if metrics_present:
+            return score
+        if route_eta is None or eta_min is None or eta_max is None:
+            return score
+
+        spread = eta_max - eta_min
+        if spread <= 1e-9:
+            return score
+
+        eta_factor = (route_eta.timestamp() - eta_min) / spread
+        adjusted = score - (0.15 * eta_factor)
+        return max(0.0, min(1.0, adjusted))
+
+    def _apply_waypoint_penalty(self, score: float, waypoints: list[str]) -> float:
+        penalty = min(len(waypoints), 4) * 0.02
+        adjusted = score - penalty
+        return max(0.0, min(1.0, adjusted))
 
     def _adjust_scores_for_map_metrics(
         self,
@@ -241,11 +421,8 @@ class ReroutingAgent:
             if not narrative.rationale.strip():
                 raise ValueError("ReroutingAgent returned empty rationale.")
             return narrative
-        except Exception:
-            return ReroutingNarrative(
-                rationale=self._fallback_rationale(request, status, selected, scored_routes),
-                confidence=0.55,
-            )
+        except Exception as exc:
+            raise RuntimeError(f"ReroutingAgent rationale generation failed: {exc}") from exc
 
     def _raise_if_run_error(self, run_output: Any) -> None:
         if not hasattr(run_output, "status"):
@@ -303,24 +480,6 @@ class ReroutingAgent:
                 return parsed
 
         raise ValueError("ReroutingAgent rationale is not valid JSON object output.")
-
-    def _fallback_rationale(
-        self,
-        request: ReroutingRequest,
-        status: str,
-        selected: ScoredRoute | None,
-        scored_routes: list[ScoredRoute],
-    ) -> str:
-        if status == "REROUTED" and selected is not None:
-            return (
-                f"Ticket {request.ticket_id}: selected the highest-scoring compliant route "
-                f"(score={selected.score:.3f}) after filtering restricted-zone and curfew violations."
-            )
-        disqualified = [route for route in scored_routes if route.disqualification_reason]
-        return (
-            f"Ticket {request.ticket_id}: no compliant alternative route remained after guardrail checks. "
-            f"Escalating for human review; {len(disqualified)} route(s) were disqualified."
-        )
 
     async def _write_audit_log(
         self,

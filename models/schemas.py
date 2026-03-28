@@ -171,6 +171,41 @@ class LogisticsRequest(BaseModel):
     packaging_result: PackagingResult | None = None
 
 
+class PackingAlgorithmResult(BaseModel):
+    strategy: Literal[
+        "guillotine_heuristic",
+        "extreme_point_rule",
+        "deepest_bottom_left",
+    ]
+    packed_items: list[str] = Field(default_factory=list)
+    unpacked_items: list[str] = Field(default_factory=list)
+    space_utilization_pct: float = Field(..., ge=0.0, le=100.0)
+    weight_utilization_pct: float = Field(..., ge=0.0, le=100.0)
+    positions: list[dict[str, float | str]] = Field(default_factory=list)
+
+
+class VehiclePackingPreview(BaseModel):
+    vehicle_id: str = Field(..., min_length=1)
+    cargo_dimensions_cm: dict[str, float] = Field(..., description="l, w, h")
+    recommended_strategy: Literal[
+        "guillotine_heuristic",
+        "extreme_point_rule",
+        "deepest_bottom_left",
+    ]
+    recommended_space_utilization_pct: float = Field(..., ge=0.0, le=100.0)
+    recommended_weight_utilization_pct: float = Field(..., ge=0.0, le=100.0)
+    algorithm_results: list[PackingAlgorithmResult] = Field(default_factory=list)
+
+    @field_validator("cargo_dimensions_cm")
+    @classmethod
+    def validate_preview_dimensions(cls, value: dict[str, float]) -> dict[str, float]:
+        return _validate_lwh_map(value, "cargo_dimensions_cm")
+
+
+class LogisticsPreviewResult(BaseModel):
+    vehicles: list[VehiclePackingPreview] = Field(default_factory=list)
+
+
 class VehiclePlan(BaseModel):
     vehicle_id: str = Field(..., min_length=1)
     packed_items: list[str] = Field(default_factory=list)
@@ -210,7 +245,7 @@ class ReroutingRequest(BaseModel):
         "restricted_zone",
     ]
     disruption_location: str = Field(..., min_length=1)
-    available_alternatives: list[RouteInput] = Field(..., min_length=1)
+    available_alternatives: list[RouteInput] = Field(default_factory=list)
     weather_score: float = Field(..., ge=0.0, le=1.0)
     road_safety_score: float = Field(..., ge=0.0, le=1.0)
     estimated_arrival_time: datetime | None = None
@@ -223,6 +258,7 @@ class ScoredRoute(BaseModel):
     map_distance_km: float | None = None
     map_duration_min: float | None = None
     map_source: str | None = None
+    map_geometry: list[tuple[float, float]] = Field(default_factory=list)
 
 
 class ReroutingResult(BaseModel):

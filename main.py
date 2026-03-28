@@ -24,11 +24,16 @@ warnings.filterwarnings(
     module=r"pydantic\._internal\._fields",
 )
 
+settings = get_settings()
+if settings.require_google_api_key and not (settings.google_api_key or "").strip():
+    raise RuntimeError(
+        "GOOGLE_API_KEY is required in strict mode. "
+        "Set GOOGLE_API_KEY (or GEMINI_API_KEY) in agent/.env before starting backend."
+    )
+
 from routers.agents import router as agents_router
 from routers.audit import router as audit_router
 from routers.pipeline import router as pipeline_router
-
-settings = get_settings()
 
 app = FastAPI(
     title=settings.app_name,

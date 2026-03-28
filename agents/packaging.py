@@ -71,13 +71,19 @@ class PackagingAgent:
     def __init__(self, audit_store: AuditStore | None = None) -> None:
         settings = get_settings()
         self._audit_store = audit_store or AuditStore(file_path="audit.jsonl")
+        api_key = (settings.google_api_key or "").strip()
+        if settings.require_google_api_key and not api_key:
+            raise RuntimeError(
+                "GOOGLE_API_KEY is required in strict mode. "
+                "Set GOOGLE_API_KEY (or GEMINI_API_KEY) in .env before starting backend."
+            )
 
         self._schema_param_name: str | None = None
         self._run_schema_param_name: str | None = None
 
         model = Gemini(
             id=settings.gemini_model_id,
-            api_key=settings.google_api_key or None,
+            api_key=api_key or None,
         )
         self._agent = self._build_agent(model)
 
@@ -127,8 +133,11 @@ class PackagingAgent:
         except Exception as exc:
             raise RuntimeError(f"PackagingAgent run failed: {exc}") from exc
 
-        self._raise_if_run_error(run_output)
-        result = self._coerce_packaging_result(self._extract_content(run_output))
+        try:
+            self._raise_if_run_error(run_output)
+            result = self._coerce_packaging_result(self._extract_content(run_output))
+        except Exception as exc:
+            raise RuntimeError(f"PackagingAgent returned invalid output: {exc}") from exc
         await self._write_audit_log(request=request, result=result)
         return result
 

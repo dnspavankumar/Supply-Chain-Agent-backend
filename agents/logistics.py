@@ -63,13 +63,19 @@ class LogisticsAgent:
     def __init__(self, audit_store: AuditStore | None = None) -> None:
         settings = get_settings()
         self._audit_store = audit_store or AuditStore(file_path="audit.jsonl")
+        api_key = (settings.google_api_key or "").strip()
+        if settings.require_google_api_key and not api_key:
+            raise RuntimeError(
+                "GOOGLE_API_KEY is required in strict mode. "
+                "Set GOOGLE_API_KEY (or GEMINI_API_KEY) in .env before starting backend."
+            )
 
         self._schema_param_name: str | None = None
         self._run_schema_param_name: str | None = None
 
         model = Gemini(
             id=settings.gemini_model_id,
-            api_key=settings.google_api_key or None,
+            api_key=api_key or None,
         )
         self._agent = self._build_agent(model)
 
@@ -239,11 +245,8 @@ class LogisticsAgent:
             if not narrative.recommendation.strip():
                 raise ValueError("Empty recommendation from LogisticsAgent.")
             return narrative
-        except Exception:
-            return LogisticsNarrative(
-                recommendation=self._fallback_recommendation(context_payload),
-                confidence=0.55,
-            )
+        except Exception as exc:
+            raise RuntimeError(f"LogisticsAgent narrative generation failed: {exc}") from exc
 
     def _raise_if_run_error(self, run_output: Any) -> None:
         if not hasattr(run_output, "status"):
@@ -301,26 +304,6 @@ class LogisticsAgent:
                 return parsed
 
         raise ValueError("LogisticsAgent recommendation is not valid JSON object output.")
-
-    def _fallback_recommendation(self, context_payload: dict[str, Any]) -> str:
-        vehicle_count = int(context_payload.get("total_vehicles_needed", 0))
-        overflow_items = context_payload.get("overflow_items", [])
-        guardrail_flags = context_payload.get("guardrail_flags", [])
-        if overflow_items:
-            return (
-                f"Use {vehicle_count} planned vehicle load(s) and hold {len(overflow_items)} overflow "
-                "item(s) for a follow-up dispatch or larger carrier. Verify dimensional constraints "
-                "before final allocation."
-            )
-        if "split_shipment_required" in guardrail_flags:
-            return (
-                f"Split the shipment across {vehicle_count} vehicles using the generated cuboid placements "
-                "to maintain safe utilization and avoid overloading."
-            )
-        return (
-            "Proceed with the generated single-vehicle packing layout; current placement balances "
-            "space utilization and weight constraints."
-        )
 
     async def _write_audit_log(
         self,

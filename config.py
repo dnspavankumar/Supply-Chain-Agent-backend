@@ -23,6 +23,10 @@ class Settings(BaseSettings):
         default="gemini-2.0-flash-001",
         validation_alias=AliasChoices("GEMINI_MODEL_ID", "AGNO_MODEL"),
     )
+    require_google_api_key: bool = Field(
+        default=True,
+        validation_alias="REQUIRE_GOOGLE_API_KEY",
+    )
     route_score_alpha: float = Field(default=0.4, validation_alias="ROUTE_SCORE_ALPHA")
     route_score_beta: float = Field(default=0.6, validation_alias="ROUTE_SCORE_BETA")
     mapbox_access_token: str = Field(default="", validation_alias="MAPBOX_ACCESS_TOKEN")
