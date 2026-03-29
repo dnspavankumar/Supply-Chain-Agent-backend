@@ -46,11 +46,7 @@ function Resolve-AppTarget {
         return "main:app"
     }
 
-    if (Test-Path (Join-Path $scriptRoot "supply_chain_agent\main.py")) {
-        return "supply_chain_agent.main:app"
-    }
-
-    throw "Could not find a FastAPI entrypoint. Expected main.py or supply_chain_agent\main.py."
+    throw "Could not find a FastAPI entrypoint. Expected main.py in the agent root."
 }
 
 $python = Resolve-Python
